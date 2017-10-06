@@ -120,6 +120,14 @@ def f1_score_script(sample_batch, tag_batch, outputs_np,
             elif i == 1:
                 break
     return score
+
+from sklearn.metrics import f1_score
+
+def batch_f1_score(tags_true, tags_pred, average='micro'):
+    return [f1_score(
+        tag_true, tag_pred, average=average, 
+        labels=[tag_id for tag_id in range(1, len(output_vocab) + 1) if id_to_tag[tag_id] != 'O']
+    ) for tag_true, tag_pred in zip(tags_true, tags_pred)]
     
 from time import time
 
@@ -155,7 +163,7 @@ eval_f1s = []
 eval_f1s_noisy = []
 
 output_mode = 'argmax'
-feed_mode = 'soft-gumbel'
+feed_mode = 'teacher-forcing'
 reinforce_strategy = 'none'
 if feed_mode != 'sampling':
     reinforce_strategy = ''
@@ -214,13 +222,13 @@ for run in range(num_runs):
         tag_batch_torch = autograd.Variable(torch.from_numpy(tag_batch).cuda(), requires_grad=False)
     
         if reinforce_strategy == 'argmax_advantage':
-            unscaled_logits, unscaled_logits_baseline, outputs = model(
+            unscaled_logits, unscaled_logits_baseline, outputs, outputs_baseline = model(
                 sample_batch_torch, tag_batch_torch,
                 output_mode=output_mode, feed_mode=feed_mode, baseline_mode='argmax',
                 attention_mode=attention_mode, dropout_rate=0.2
             )
         else:
-            unscaled_logits, _, outputs = model(
+            unscaled_logits, _, outputs, _ = model(
                 sample_batch_torch, tag_batch_torch,
                 output_mode=output_mode, feed_mode=feed_mode, baseline_mode=None,
                 attention_mode=attention_mode, dropout_rate=0.2, softmax_temperature=softmax_temperature
@@ -327,7 +335,7 @@ for run in range(num_runs):
             sample_batch_torch = autograd.Variable(torch.from_numpy(sample_batch).cuda(), requires_grad=False)
             tag_batch_torch = autograd.Variable(torch.from_numpy(tag_batch).cuda(), requires_grad=False)
     
-            unscaled_logits, _, outputs = model(
+            unscaled_logits, _, outputs, _ = model(
                 sample_batch_torch,
                 output_mode='argmax', feed_mode='same', attention_mode=attention_mode, dropout_rate=0.0
             )
@@ -342,7 +350,7 @@ for run in range(num_runs):
             eval_losses[-1].append(eval_loss.data.cpu().numpy().mean())
             eval_f1s[-1].append(eval_f1)
         
-            unscaled_logits, _, outputs = model(
+            unscaled_logits, _, outputs, _ = model(
                 sample_batch_torch,
                 output_mode='argmax', feed_mode='noise', attention_mode=attention_mode, dropout_rate=0.0
             )

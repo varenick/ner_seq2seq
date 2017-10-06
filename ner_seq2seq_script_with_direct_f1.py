@@ -99,9 +99,17 @@ def f1_score_script(sample_batch, tag_batch, outputs_np,
                 break
     return score
     
+from sklearn.metrics import f1_score
+
+def batch_f1_score(tags_true, tags_pred, average='micro'):
+    return np.array([f1_score(
+        tag_true, tag_pred, average=average, 
+        labels=[tag_id for tag_id in range(1, len(output_vocab) + 1) if id_to_tag[tag_id] != 'O']
+    ) for tag_true, tag_pred in zip(tags_true, tags_pred)])
+    
 from time import time
 
-train_batch_size = 1024
+train_batch_size = 256
 eval_batch_size = 1024
 decode_batch_size = 4
 test_batch_size = 2048
@@ -118,7 +126,7 @@ model_params = {
     'num_hidden': 64
 }
 
-num_runs = 5
+num_runs = 1
 
 num_steps = 3000
 print_skip = 100
@@ -136,7 +144,7 @@ eval_f1s_noisy = []
 
 output_mode = 'argmax'
 feed_mode = 'sampling'
-reinforce_strategy = 'direct'
+reinforce_strategy = 'none'
 if feed_mode != 'sampling':
     reinforce_strategy = ''
 softmax_temperature = 1.
@@ -145,9 +153,9 @@ if feed_mode not in ['soft-gumbel', 'hard-gumbel']:
     
 attention_mode = 'fixed'
 
-mode_name = feed_mode + '_' + str(softmax_temperature) + '_' + reinforce_strategy + '_' + attention_mode
+mode_name = feed_mode + '_' + str(softmax_temperature) + '_' + reinforce_strategy + '_' + attention_mode + '_large_batch'
 
-do_eval = True
+do_eval = False
 
 av_advantage = None
 std_advantage = None
@@ -185,8 +193,7 @@ for run in range(num_runs):
     
     grad_norms = []
 
-    init_lr = 0.001
-    lr = init_lr
+    lr = 0.001
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     for step in range(num_steps):        
@@ -209,6 +216,12 @@ for run in range(num_runs):
                 attention_mode=attention_mode, dropout_rate=0.2, softmax_temperature=softmax_temperature
             )
         train_loss = loss_function(unscaled_logits.view(-1, output_vocab_size), tag_batch_torch.view(-1))
+
+        train_f1 = batch_f1_score(
+            tag_batch, outputs.data.cpu().numpy()
+        )            
+        train_f1s[-1].append(np.mean(train_f1) * 100)
+        cum_train_f1 += train_f1s[-1][-1]
         
         if reinforce_strategy == 'element':
             tag_batch_torch_one_hot = torch.zeros(train_batch_size, chunk_length, output_vocab_size).cuda()
@@ -281,36 +294,31 @@ for run in range(num_runs):
                     (-1) * (seq_av_train_loss - train_av_loss) / (train_batch_size * chunk_length)
                 )
                 
-        elif reinforce_strategy == 'none' or reinforce_strategy == 'direct' and step < 200:
+        elif reinforce_strategy == 'none' or reinforce_strategy == 'direct' and step < 500:
             for t, dec_feed in enumerate(model.dec_feeds):
                 dec_feed.reinforce(torch.zeros(train_batch_size, 1).cuda())
 
         elif reinforce_strategy == 'direct':
-            train_f1 = f1_score_script(
-                sample_batch, tag_batch, outputs.data.cpu().numpy(),
-                print_result=False,
-                test_output_fname='test_output_' + mode_name + '.txt',
-                report_fname='report_' + mode_name + '.txt'
-            )
-            train_f1_baseline = f1_score_script(
-                sample_batch, tag_batch, outputs_baseline.data.cpu().numpy(),
-                print_result=False,
-                test_output_fname='test_output_' + mode_name + '.txt',
-                report_fname='report_' + mode_name + '.txt'
+            #if step == 0:
+            #    lr = init_lr / 10
+            #    optimizer = optim.Adam(model.parameters(), lr=lr)
+            
+            train_f1_baseline = batch_f1_score(
+                tag_batch, outputs_baseline.data.cpu().numpy()
             )
             #train_f1_baseline = 0
-            for t, dec_feed in enumerate(model.dec_feeds):
-                dec_feed.reinforce(torch.zeros(train_batch_size, 1).cuda() + (train_f1 - train_f1_baseline) / (100 * train_batch_size * MAX_SAMPLE_LENGTH))
             
-            train_f1s[-1].append(train_f1)
-            cum_train_f1 += train_f1
-        
+            for t, dec_feed in enumerate(model.dec_feeds):
+                dec_feed.reinforce(torch.from_numpy(train_f1 - train_f1_baseline).float().view(train_batch_size, 1).cuda() / (MAX_SAMPLE_LENGTH * train_batch_size))
+                
+            av_advantage.append(np.mean(train_f1 - train_f1_baseline))
+            std_advantage.append(np.std(train_f1 - train_f1_baseline))
             
         elif reinforce_strategy:
             raise ValueError("Invalid reinforce_strategy: '{}'".format(reinforce_strategy))
             
         optimizer.zero_grad()
-        if reinforce_strategy == 'direct' and step >= 200:
+        if reinforce_strategy == 'direct' and step >= 500:
             autograd.backward(model.dec_feeds, [None for _ in model.dec_feeds])
         else:
             train_loss.backward()
@@ -318,7 +326,37 @@ for run in range(num_runs):
         #lr = init_lr / (step + 1) ** 0.5
         #for group in optimizer.param_groups:
         #    group['lr'] = lr
-        optimizer.step()
+        if reinforce_strategy == 'direct' and step >= 500:
+            parameters_dump = [param.clone() for param in model.parameters()]
+            init_lr = 1.0
+            lr = init_lr
+            while True:
+                optimizer = optim.SGD(model.parameters(), lr=lr)
+                optimizer.step()
+                unscaled_logits_new, _, outputs_new, _ = model(
+                    sample_batch_torch, tag_batch_torch,
+                    output_mode=output_mode, feed_mode=feed_mode, baseline_mode=None,
+                    attention_mode=attention_mode, dropout_rate=0.2, softmax_temperature=softmax_temperature
+                )
+                train_f1_new = batch_f1_score(
+                    tag_batch, outputs_new.data.cpu().numpy()
+                )
+                if np.mean(train_f1_new) > np.mean(train_f1):
+                    break
+                else:
+                    #optimizer = optim.SGD(model.parameters(), lr=-lr)
+                    #optimizer.step()
+                    lr *= 0.5
+                    if np.abs(lr) < 1e-5:
+                        #print(0)
+                        break
+                    #print(lr)
+                    for param, param_dump in zip(
+                        model.parameters(), parameters_dump
+                    ):
+                        param = param_dump
+        else:
+            optimizer.step()
         
         grad_norms.append([])
         for param in model.parameters():
@@ -420,3 +458,8 @@ for name in ['train_losses', 'train_f1s', 'eval_losses', 'eval_f1s']:
         for suffix in ['_mean', '_std', '']:
             with open(mode_name + '/' + name + infix + suffix + '.dat', 'wb') as f:
                 pickle.dump(eval(name + infix + suffix), f)
+
+with open(mode_name + '/av_advantage.dat', 'wb') as f:
+    pickle.dump(av_advantage, f)
+with open(mode_name + '/std_advantage.dat', 'wb') as f:
+    pickle.dump(std_advantage, f)
